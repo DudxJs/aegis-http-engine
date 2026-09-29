@@ -1,6 +1,6 @@
 --[[
     Aegis HTTP Engine
-    Version : 1.0.0
+    Version : 1.1.0
     License : MIT
     Repo    : https://github.com/DudxJs/aegis-http-engine
 
@@ -17,7 +17,7 @@
 
 if getgenv().Aegis then return getgenv().Aegis end
 
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 
 ----------------------------------------------------------------------
 -- CONFIG
@@ -31,8 +31,11 @@ local DEFAULTS = {
     RecheckInterval = 2,          -- seconds between integrity checks
     CleanupInterval = 3,          -- seconds between spy-log cleanups
 
-    StrictOriginalCheck = false,  -- treat getoriginalfunction() mismatch as a hook (may false-positive on some executors)
-    ReportOnMetaMismatch = false, -- report when __namecall is replaced outside Aegis wrappers
+    -- Detection tuning. Both default to true: a hook disguised with newcclosure()
+    -- (so islclosure() reports false) is still caught by these two checks.
+    TrustOriginalFunctionCheck = true, -- treat any getoriginalfunction() mismatch as a hook
+    TrustExecutorClosureCheck = true,  -- treat isexecutorclosure()/checkclosure() == true as a hook
+    ReportOnMetaMismatch = false,      -- report when __namecall is replaced outside Aegis wrappers
 
     DeepScan = true,              -- heuristic GC scan for spy-like functions
     DeepScanInterval = 20,
@@ -113,6 +116,7 @@ local HTTP_METHODS = {
     GetAsync = true,
     PostAsync = true,
     RequestAsync = true,
+    GetObjects = true, -- game:GetObjects(assetId) also fetches over the network
 }
 
 -- Allows both Aegis:Method(x) and Aegis.Method(x)
@@ -199,7 +203,9 @@ end
 local function pickOriginal(prev, expectedName)
     local fallback
     for f in pairs(deepCollect(prev, {}, 0)) do
-        if isc(f) and not islc(f) then
+        local looksNative = isc(f) and not islc(f)
+        local looksGenuine = not (cfg.TrustExecutorClosureCheck and isExec(f))
+        if looksNative and looksGenuine then
             local n = try(debug.info, f, "n")
             if n == expectedName then return f end
             if n == nil or n == "" then fallback = fallback or f end
@@ -212,13 +218,28 @@ local function recoverOriginal(fn, name, short)
     if type(fn) ~= "function" then return nil, false end
     local hooked = false
 
+    -- Basic check: a genuine Lua-closure hook.
     if islc(fn) then hooked = true end
+
+    -- newcclosure() disguise check: some spies wrap their hook in newcclosure()
+    -- specifically so islclosure()/iscclosure() report it as a native C function.
+    -- isexecutorclosure() / checkclosure() see through that disguise on most
+    -- executors, because it flags anything the executor itself generated,
+    -- regardless of how it presents to islclosure().
+    if cfg.TrustExecutorClosureCheck and isExec(fn) then
+        hooked = true
+        log("Executor-generated closure detected on " .. name .. " (possible newcclosure() disguised hook)")
+    end
 
     local restored
     pcall(function() restored = getoriginalfunction(fn) end)
     if restored and type(restored) == "function" and isc(restored) then
         if restored ~= fn then
-            if cfg.StrictOriginalCheck then hooked = true end
+            -- getoriginalfunction() found a different underlying function than what's
+            -- currently installed. On virtually every executor that implements it,
+            -- that only happens when something hooked the target - including
+            -- newcclosure()-disguised hooks that fooled the checks above.
+            if cfg.TrustOriginalFunctionCheck then hooked = true end
             pcall(realHookFunction, fn, restored)
         end
         return restored, hooked
@@ -233,14 +254,17 @@ local function recoverOriginal(fn, name, short)
         return try(clonefunction, fn), hooked
     end
 
-    if islc(prev) then
+    -- A hook is either a genuine Lua closure, or an executor-generated closure
+    -- (islc(prev) false, isExec(prev) true) disguised via newcclosure() - in
+    -- both cases the real original is most likely sitting in its upvalues.
+    if islc(prev) or (cfg.TrustExecutorClosureCheck and isExec(prev)) then
         local f = pickOriginal(prev, short)
         if f then
             realHookFunction(fn, f)
             return f, true
         end
         local cl = try(clonefunction, prev)
-        if cl and isc(cl) then
+        if cl and isc(cl) and not (cfg.TrustExecutorClosureCheck and isExec(cl)) then
             realHookFunction(fn, cl)
             return cl, true
         end
@@ -258,6 +282,7 @@ end
 local targets = {
     { key = "HttpGet",      short = "HttpGet",      name = "game.HttpGet",             get = function() return game.HttpGet end },
     { key = "HttpPost",     short = "HttpPost",     name = "game.HttpPost",            get = function() return game.HttpPost end },
+    { key = "GetObjects",   short = "GetObjects",   name = "game.GetObjects",          get = function() return game.GetObjects end },
     { key = "GetAsync",     short = "GetAsync",     name = "HttpService.GetAsync",     get = function() return HttpService.GetAsync end },
     { key = "PostAsync",    short = "PostAsync",    name = "HttpService.PostAsync",    get = function() return HttpService.PostAsync end },
     { key = "RequestAsync", short = "RequestAsync", name = "HttpService.RequestAsync", get = function() return HttpService.RequestAsync end },
@@ -431,8 +456,21 @@ end)
 ----------------------------------------------------------------------
 -- DEEP SCAN (heuristic)
 ----------------------------------------------------------------------
-local SPY_HTTP = { HttpGet = true, HttpPost = true, GetAsync = true, PostAsync = true, RequestAsync = true, request = true, http_request = true }
-local SPY_HOOK = { getnamecallmethod = true, hookmetamethod = true, hookfunction = true, __namecall = true }
+-- Three independent categories of tell-tale constants. Two matching categories
+-- in the same function is treated as suspicious - a single category alone is
+-- too common in unrelated, legitimate scripts to act on.
+local SPY_HTTP = {
+    HttpGet = true, HttpPost = true, GetAsync = true, PostAsync = true, RequestAsync = true,
+    GetObjects = true, request = true, http_request = true, reqfunc = true,
+}
+local SPY_HOOK = {
+    getnamecallmethod = true, hookmetamethod = true, hookfunction = true, __namecall = true,
+    replaceclosure = true, getoriginalfunction = true, newcclosure = true,
+}
+local SPY_UI = {
+    ScreenGui = true, CoreGui = true, ["Requests: "] = true, ["Http Logs"] = true,
+    ["Clear Logs"] = true, ["Filter requests..."] = true,
+}
 local seenSuspicious = {}
 
 local function deepScan()
@@ -443,18 +481,23 @@ local function deepScan()
         n += 1
         if n % 500 == 0 then task.wait() end
 
-        if type(obj) == "function" and not isc(obj) and isExec(obj) then
+        -- Any function the executor generated is a candidate, regardless of
+        -- whether it disguises itself as a C-closure via newcclosure().
+        if type(obj) == "function" and isExec(obj) then
             local src = try(debug.info, obj, "s")
             if src ~= mySource then
                 local consts = try(getconstants, obj)
                 if type(consts) == "table" then
-                    local h, k = false, false
+                    local h, k, u = false, false, false
                     for _, c in pairs(consts) do
                         if type(c) == "string" then
-                            if SPY_HTTP[c] then h = true elseif SPY_HOOK[c] then k = true end
+                            if SPY_HTTP[c] then h = true end
+                            if SPY_HOOK[c] then k = true end
+                            if SPY_UI[c] then u = true end
                         end
                     end
-                    if h and k then
+                    local categories = (h and 1 or 0) + (k and 1 or 0) + (u and 1 or 0)
+                    if categories >= 2 then
                         found += 1
                         local key = tostring(src)
                         if not seenSuspicious[key] then

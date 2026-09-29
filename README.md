@@ -2,7 +2,7 @@
 
 **HTTP spy protection for Roblox executors.** Detects, neutralizes and monitors HTTP spies (request loggers) so your scripts' network traffic stays private.
 
-![version](https://img.shields.io/badge/version-1.0.0-blue) ![license](https://img.shields.io/badge/license-MIT-green) ![platform](https://img.shields.io/badge/platform-Roblox-red)
+![version](https://img.shields.io/badge/version-1.1.0-blue) ![license](https://img.shields.io/badge/license-MIT-green) ![platform](https://img.shields.io/badge/platform-Roblox-red)
 
 ---
 
@@ -26,7 +26,7 @@ Aegis:HttpSpy(true)  -- enable
 ### Pin a version (recommended for production)
 
 ```lua
-loadstring(game:HttpGet("https://raw.githubusercontent.com/DudxJs/aegis-http-engine/refs/tags/v1.0.0/Loader.lua"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/DudxJs/aegis-http-engine/refs/tags/v1.1.0/Loader.lua"))()
 ```
 
 ---
@@ -34,16 +34,17 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/DudxJs/aegis-http-eng
 ## Features
 
 - Detects Lua-closure hooks and hooks made through `hookfunction` / `hookmetamethod`
+- Detects hooks disguised with `newcclosure()` to evade `islclosure()`-based checks
 - Recovers the original HTTP functions and neutralizes the spy
 - Continuous integrity checks: catches spies loaded **after** Aegis
 - Blocks attempts to hook protected HTTP functions (including `replaceclosure`, `hookfunc`, `detour_function`)
 - Routes HTTP `__namecall` methods to the original functions, even if other scripts hook `__namecall`
 - Cleans spy logs from memory
-- Heuristic deep scan for spy-like functions
+- Heuristic deep scan for spy-like functions (HTTP, hook-related and spy-GUI constant matching)
 - Safe request helpers that bypass hooks
 - Event system, configurable actions, runtime on/off
 
-Covered: `game:HttpGet`, `game:HttpPost`, `HttpService:GetAsync`, `HttpService:PostAsync`, `HttpService:RequestAsync`, `request`, `http_request`, `http.request`, `syn.request`.
+Covered: `game:HttpGet`, `game:HttpPost`, `game:GetObjects`, `HttpService:GetAsync`, `HttpService:PostAsync`, `HttpService:RequestAsync`, `request`, `http_request`, `http.request`, `syn.request`.
 
 ---
 
@@ -109,7 +110,8 @@ loadstring(game:HttpGet("https://raw.githubusercontent.com/DudxJs/aegis-http-eng
 | `OnDetect` | `nil` | Callback `function(info)` registered at load time. |
 | `RecheckInterval` | `2` | Seconds between integrity checks. |
 | `CleanupInterval` | `3` | Seconds between spy-log cleanups. |
-| `StrictOriginalCheck` | `false` | Treat a `getoriginalfunction` mismatch as a hook. May false-positive on some executors. |
+| `TrustOriginalFunctionCheck` | `true` | Treat a `getoriginalfunction()` mismatch as a hook. |
+| `TrustExecutorClosureCheck` | `true` | Treat `isexecutorclosure()`/`checkclosure() == true` as a hook. Catches hooks disguised with `newcclosure()`. Disable only if your executor false-positives on this. |
 | `ReportOnMetaMismatch` | `false` | Report when `__namecall` is replaced outside Aegis wrappers. |
 | `DeepScan` | `true` | Heuristic GC scan. |
 | `DeepScanInterval` | `20` | Seconds between deep scans. |
